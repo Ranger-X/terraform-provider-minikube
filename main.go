@@ -1,9 +1,9 @@
 package main
 
 import (
+	"github.com/Ranger-X/terraform-provider-minikube/minikube"
 	"github.com/hashicorp/terraform/plugin"
 	"github.com/hashicorp/terraform/terraform"
-	"github.com/jgensler8/terraform-provider-minikube/minikube"
 )
 
 func main() {

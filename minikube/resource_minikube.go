@@ -17,8 +17,8 @@ import (
 	"github.com/docker/machine/libmachine/state"
 	"github.com/hashicorp/terraform/helper/schema"
 	"k8s.io/minikube/cmd/minikube/cmd"
-	cmdUtil "k8s.io/minikube/cmd/util"
-	cmdutil "k8s.io/minikube/cmd/util"
+	//cmdUtil "k8s.io/minikube/cmd/util"
+	//cmdutil "k8s.io/minikube/cmd/util"
 	"k8s.io/minikube/pkg/minikube/cluster"
 	cfg "k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
@@ -286,7 +286,7 @@ func resourceMinikubeRead(d *schema.ResourceData, meta interface{}) error {
 			return err
 		}
 
-		apiserverPort, err := pkgutil.GetPortFromKubeConfig(cmdUtil.GetKubeConfigPath(), cfg.GetMachineName())
+		apiserverPort, err := pkgutil.GetPortFromKubeConfig(GetKubeConfigPath(), cfg.GetMachineName())
 		if err != nil {
 			// Fallback to presuming default apiserver port
 			apiserverPort = pkgutil.APIServerPort
@@ -301,7 +301,7 @@ func resourceMinikubeRead(d *schema.ResourceData, meta interface{}) error {
 			returnCode |= clusterNotRunningStatusFlag
 		}
 
-		kstatus, err := pkgutil.GetKubeConfigStatus(ip, cmdUtil.GetKubeConfigPath(), cfg.GetMachineName())
+		kstatus, err := pkgutil.GetKubeConfigStatus(ip, GetKubeConfigPath(), cfg.GetMachineName())
 		if err != nil {
 			log.Printf("Error kubeconfig status: %v", err)
 			return err
@@ -516,7 +516,7 @@ func resourceMinikubeCreate(d *schema.ResourceData, meta interface{}) error {
 	kubeHost = strings.Replace(kubeHost, ":2376", ":"+strconv.Itoa(pkgutil.APIServerPort), -1)
 
 	log.Println("Setting up kubeconfig...")
-	kubeConfigFile := cmdutil.GetKubeConfigPath()
+	kubeConfigFile := GetKubeConfigPath()
 	kubeCfgSetup := &pkgutil.KubeConfigSetup{
 		ClusterName:          cfg.GetMachineName(),
 		ClusterServerAddress: kubeHost,
@@ -654,7 +654,7 @@ func resourceMinikubeDelete(d *schema.ResourceData, _ interface{}) error {
 	}
 	fmt.Println("Machine deleted.")
 
-	if err := cmdUtil.KillMountProcess(); err != nil {
+	if err := KillMountProcess(); err != nil {
 		log.Println("Errors occurred deleting mount process: ", err)
 	}
 
