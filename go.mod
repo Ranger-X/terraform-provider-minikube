@@ -8,11 +8,15 @@ require (
 	github.com/blang/semver v3.5.1+incompatible
 	github.com/docker/machine v0.16.2
 	github.com/hashicorp/terraform v0.12.24
-	github.com/jteeuwen/go-bindata v3.0.7+incompatible
+	github.com/imdario/mergo v0.3.9
+	github.com/spf13/viper v1.3.2
 	k8s.io/minikube v1.9.2
 )
 
 replace (
+	// we need this because of google/go-containerregistry/pkg/v1/daemon undefined: client.NewClientWithOpts (https://github.com/kubernetes/minikube/pull/6073)
+	github.com/docker/docker => github.com/docker/docker v1.4.2-0.20190924003213-a8608b5b67c7
+	github.com/samalba/dockerclient => github.com/sayboras/dockerclient v0.0.0-20191231050035-015626177a97
 	k8s.io/api => k8s.io/api v0.0.0-20200404061942-2a93acf49b83
 	k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.0.0-20200404065651-967ad5e9a7ed
 	k8s.io/apimachinery => k8s.io/apimachinery v0.17.5-beta.0.0.20200404061537-491fc9063aba
@@ -40,9 +44,6 @@ replace (
 	//	k8s.io/node-api => k8s.io/node-api v0.0.0-20200404072643-ebfdb5d0d07d
 	//	k8s.io/repo-infra => k8s.io/repo-infra v0.0.0-20181204233714-00fe14e3d1a3
 	k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.0.0-20200404064810-8ef12cfc2adc
-	// we need this because of google/go-containerregistry/pkg/v1/daemon undefined: client.NewClientWithOpts (https://github.com/kubernetes/minikube/pull/6073)
-	github.com/docker/docker => github.com/docker/docker v1.4.2-0.20190924003213-a8608b5b67c7
-	github.com/samalba/dockerclient => github.com/sayboras/dockerclient v0.0.0-20191231050035-015626177a97
 //	k8s.io/sample-cli-plugin => k8s.io/sample-cli-plugin v0.0.0-20200404070450-f763b37e0e42
 //	k8s.io/sample-controller => k8s.io/sample-controller v0.0.0-20200404065217-7719b71fbe5a
 //	k8s.io/utils => k8s.io/utils v0.0.0-20190801114015-581e00157fb1

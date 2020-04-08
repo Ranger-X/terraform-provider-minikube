@@ -2,26 +2,28 @@ package minikube
 
 import (
 	b64 "encoding/base64"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/blang/semver"
 	"github.com/docker/machine/libmachine/state"
 	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/imdario/mergo"
+	"github.com/spf13/viper"
 	"k8s.io/minikube/cmd/minikube/cmd"
-	//cmdUtil "k8s.io/minikube/cmd/util"
-	//cmdutil "k8s.io/minikube/cmd/util"
+	"k8s.io/minikube/pkg/minikube/bootstrapper"
 	"k8s.io/minikube/pkg/minikube/cluster"
 	cfg "k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
+	"k8s.io/minikube/pkg/minikube/driver"
+	"k8s.io/minikube/pkg/minikube/kubeconfig"
+	"k8s.io/minikube/pkg/minikube/localpath"
 	"k8s.io/minikube/pkg/minikube/machine"
 	pkgutil "k8s.io/minikube/pkg/util"
 	"k8s.io/minikube/pkg/version"
@@ -30,8 +32,9 @@ import (
 const clusterNotRunningStatusFlag = 1 << 1
 
 var (
-	clusterBootstrapper string = "kubeadm"
-	profile             string = "minikube"
+	clusterBootstrapper string = bootstrapper.Kubeadm
+	profile             string = "terraform_minikube" //constants.DefaultClusterName
+	minimumDiskSizeInMB int    = 3000
 )
 
 func resourceMinikube() *schema.Resource {
@@ -39,8 +42,15 @@ func resourceMinikube() *schema.Resource {
 		Create: resourceMinikubeCreate,
 		Read:   resourceMinikubeRead,
 		Delete: resourceMinikubeDelete,
-
+		// https://github.com/kubernetes/minikube/blob/e098a3c4ca91f7907705a99e4e3466868afca482/cmd/minikube/cmd/start_flags.go
 		Schema: map[string]*schema.Schema{
+			"addons": &schema.Schema{
+				Type:        schema.TypeList,
+				Description: "Enable addons. see `minikube addons list` for a list of valid addon names.",
+				Elem:        &schema.Schema{Type: schema.TypeMap},
+				ForceNew:    true,
+				Optional:    true,
+			},
 			"apiserver_name": &schema.Schema{
 				Type:        schema.TypeString,
 				Description: "The apiserver name which is used in the generated certificate for localkube/kubernetes.  This can be used if you want to make the apiserver available from outside the machine (default \"minikubeCA\")",
@@ -71,7 +81,7 @@ func resourceMinikube() *schema.Resource {
 			},
 			"disable_driver_mounts": &schema.Schema{
 				Type:        schema.TypeBool,
-				Description: "Disables the filesystem mounts provided by the hypervisors (vboxfs, xhyve-9p)",
+				Description: "Disables the filesystem mounts provided by the VirtualBox",
 				Default:     true,
 				ForceNew:    true,
 				Optional:    true,
@@ -104,7 +114,14 @@ func resourceMinikube() *schema.Resource {
 				ForceNew:    true,
 				Optional:    true,
 			},
-			"extra_config": &schema.Schema{
+			"driver": &schema.Schema{
+				Type:        schema.TypeString,
+				Description: fmt.Sprintf("Driver is one of: %v (defaults to virtualbox)", driver.DisplaySupportedDrivers()),
+				Default:     "virtualbox",
+				ForceNew:    true,
+				Optional:    true,
+			},
+			"extra_options": &schema.Schema{
 				Type: schema.TypeString,
 				Description: `A set of key=value pairs that describe configuration that may be passed to different components.
 The key should be '.' separated, and the first part before the dot is the component to apply the configuration to.
@@ -112,6 +129,27 @@ Valid components are: kubelet, apiserver, controller-manager, etcd, proxy, sched
 				Default:  "",
 				ForceNew: true,
 				Optional: true,
+			},
+			"hyperv_virtual_switch": &schema.Schema{
+				Type:        schema.TypeString,
+				Description: "The hyperv virtual switch name. Defaults to first found. (hyperv driver only)",
+				Default:     "",
+				ForceNew:    true,
+				Optional:    true,
+			},
+			"hyperv_use_external_switch": &schema.Schema{
+				Type:        schema.TypeBool,
+				Description: "Whether to use external switch over Default Switch if virtual switch not explicitly specified. (hyperv driver only)",
+				Default:     false,
+				ForceNew:    true,
+				Optional:    true,
+			},
+			"hyperv_external_adapter": &schema.Schema{
+				Type:        schema.TypeString,
+				Description: "External Adapter on which external switch will be created if no external switch is found. (hyperv driver only)",
+				Default:     "",
+				ForceNew:    true,
+				Optional:    true,
 			},
 			"feature_gates": &schema.Schema{
 				Type:        schema.TypeString,
@@ -122,21 +160,14 @@ Valid components are: kubelet, apiserver, controller-manager, etcd, proxy, sched
 			},
 			"host_only_cidr": &schema.Schema{
 				Type:        schema.TypeString,
-				Description: "The CIDR to be used for the minikube VM (only supported with Virtualbox driver) (default \"192.168.99.1/24\")",
+				Description: "The CIDR to be used for the minikube VM (virtualbox driver only) (default \"192.168.99.1/24\")",
 				Default:     "192.168.99.1/24",
-				ForceNew:    true,
-				Optional:    true,
-			},
-			"hyperv_virtual_switch": &schema.Schema{
-				Type:        schema.TypeString,
-				Description: "The hyperv virtual switch name. Defaults to first found. (only supported with HyperV driver)",
-				Default:     "",
 				ForceNew:    true,
 				Optional:    true,
 			},
 			"insecure_registry": &schema.Schema{
 				Type:        schema.TypeList,
-				Description: "Insecure Docker registries to pass to the Docker daemon (default [10.0.0.0/24])",
+				Description: "Insecure Docker registries to pass to the Docker daemon.  The default service CIDR range will automatically be added.",
 				Elem:        &schema.Schema{Type: schema.TypeString},
 				//Default: []string{"10.0.0.0/24"},
 				ForceNew: true,
@@ -144,8 +175,8 @@ Valid components are: kubelet, apiserver, controller-manager, etcd, proxy, sched
 			},
 			"iso_url": &schema.Schema{
 				Type:        schema.TypeString,
-				Description: "Location of the minikube iso (default \"https://storage.googleapis.com/minikube/iso/minikube-v1.2.0.iso\")",
-				Default:     "https://storage.googleapis.com/minikube/iso/minikube-v1.2.0.iso",
+				Description: "Location of the minikube iso (default \"https://storage.googleapis.com/minikube/iso/minikube-v1.9.2.iso\")",
+				Default:     "https://storage.googleapis.com/minikube/iso/minikube-v1.9.2.iso",
 				ForceNew:    true,
 				Optional:    true,
 			},
@@ -159,14 +190,14 @@ Valid components are: kubelet, apiserver, controller-manager, etcd, proxy, sched
 			"kubernetes_version": &schema.Schema{
 				Type: schema.TypeString,
 				Description: `The kubernetes version that the minikube VM will use (ex: v1.2.3)
- OR a URI which contains a localkube binary (ex: https://storage.googleapis.com/minikube/k8sReleases/v1.3.0/localkube-linux-amd64) (default "v1.15.0")`,
-				Default:  "v1.15.0",
+ OR a URI which contains a localkube binary (ex: https://storage.googleapis.com/minikube/k8sReleases/v1.3.0/localkube-linux-amd64) (default "v1.16.8")`,
+				Default:  "v1.16.8",
 				ForceNew: true,
 				Optional: true,
 			},
 			"kvm_network": &schema.Schema{
 				Type:        schema.TypeString,
-				Description: "The KVM network name. (only supported with KVM driver) (default \"default\")",
+				Description: "The KVM network name. (kvm2 driver only) (default \"default\")",
 				Default:     "default",
 				ForceNew:    true,
 				Optional:    true,
@@ -178,20 +209,20 @@ Valid components are: kubelet, apiserver, controller-manager, etcd, proxy, sched
 				ForceNew:    true,
 				Optional:    true,
 			},
-			"mount": &schema.Schema{
-				Type:        schema.TypeBool,
-				Description: "This will start the mount daemon and automatically mount files into minikube",
-				Default:     false,
-				ForceNew:    true,
-				Optional:    true,
-			},
-			"mount_string": &schema.Schema{
-				Type:        schema.TypeString,
-				Description: "The argument to pass the minikube mount command on start (default \"/Users:/minikube-host\")",
-				Default:     "/Users:/minikube-host",
-				ForceNew:    true,
-				Optional:    true,
-			},
+			//"mount": &schema.Schema{
+			//	Type:        schema.TypeBool,
+			//	Description: "This will start the mount daemon and automatically mount files into minikube",
+			//	Default:     false,
+			//	ForceNew:    true,
+			//	Optional:    true,
+			//},
+			//"mount_string": &schema.Schema{
+			//	Type:        schema.TypeString,
+			//	Description: "The argument to pass the minikube mount command on start (default \"/Users:/minikube-host\")",
+			//	Default:     "/Users:/minikube-host",
+			//	ForceNew:    true,
+			//	Optional:    true,
+			//},
 			"network_plugin": &schema.Schema{
 				Type:        schema.TypeString,
 				Description: "The name of the network plugin",
@@ -206,27 +237,14 @@ Valid components are: kubelet, apiserver, controller-manager, etcd, proxy, sched
 				ForceNew:    true,
 				Optional:    true,
 			},
-			"scheme": &schema.Schema{
-				Type:        schema.TypeString,
-				Description: "HTTP or HTTPS",
-				Default:     "https",
-				ForceNew:    true,
-				Optional:    true,
-			},
-			"vm_driver": &schema.Schema{
-				Type:        schema.TypeString,
-				Description: "VM driver is one of: [virtualbox xhyve vmwarefusion hyperkit] (default \"virtualbox\")",
-				Default:     "virtualbox",
-				ForceNew:    true,
-				Optional:    true,
-			},
-			"xhyve_disk_driver": &schema.Schema{
-				Type:        schema.TypeString,
-				Description: "The disk driver to use [ahci-hd|virtio-blk] (only supported with xhyve driver) (default \"ahci-hd\")",
-				Default:     "ahci-hd",
-				ForceNew:    true,
-				Optional:    true,
-			},
+			//"scheme": &schema.Schema{
+			//	Type:        schema.TypeString,
+			//	Description: "HTTP or HTTPS",
+			//	Default:     "https",
+			//	ForceNew:    true,
+			//	Optional:    true,
+			//},
+
 			"client_certificate": &schema.Schema{
 				Type:        schema.TypeString,
 				Description: "Base64 encoded public certificate used by clients to authenticate to the cluster endpoint.",
@@ -259,7 +277,7 @@ func resourceMinikubeRead(d *schema.ResourceData, meta interface{}) error {
 	}
 	defer api.Close()
 
-	hostSt, err := cluster.GetHostStatus(api)
+	hostSt, err := machine.Status(api, profile)
 	if err != nil {
 		log.Printf("Error getting host status: %v", err)
 		return err
@@ -268,8 +286,19 @@ func resourceMinikubeRead(d *schema.ResourceData, meta interface{}) error {
 	kubeletSt := state.None.String()
 	apiserverSt := state.None.String()
 	ks := state.None.String()
+
+	clusterConfig, err := getClusterConfigFromResource(d)
+	if err != nil {
+		log.Printf("Error getting minikube cluster config from terraform resource: %s", err)
+		return err
+	}
+
+	nodeConfig := clusterConfig.Nodes[0]
+	nodeName := nodeConfig.Name
+
 	if hostSt == state.Running.String() {
-		clusterBootstrapper, err := cmd.GetClusterBootstrapper(api, clusterBootstrapper)
+
+		clusterBootstrapper, err := cluster.Bootstrapper(api, clusterBootstrapper, clusterConfig, nodeConfig)
 		if err != nil {
 			log.Printf("Error getting cluster bootstrapper: %s", err)
 			return err
@@ -280,19 +309,15 @@ func resourceMinikubeRead(d *schema.ResourceData, meta interface{}) error {
 			return err
 		}
 
-		ip, err := cluster.GetHostDriverIP(api, cfg.GetMachineName())
+		ip, err := cluster.GetHostDriverIP(api, nodeName)
 		if err != nil {
 			log.Printf("Error host driver ip status: %v", err)
 			return err
 		}
 
-		apiserverPort, err := pkgutil.GetPortFromKubeConfig(GetKubeConfigPath(), cfg.GetMachineName())
-		if err != nil {
-			// Fallback to presuming default apiserver port
-			apiserverPort = pkgutil.APIServerPort
-		}
+		apiserverPort := nodeConfig.Port
 
-		apiserverSt, err = clusterBootstrapper.GetAPIServerStatus(ip, apiserverPort)
+		apiserverSt, err = clusterBootstrapper.GetAPIServerStatus(ip.String(), apiserverPort)
 		returnCode := 0
 		if err != nil {
 			log.Printf("Error api-server status: %v", err)
@@ -301,12 +326,12 @@ func resourceMinikubeRead(d *schema.ResourceData, meta interface{}) error {
 			returnCode |= clusterNotRunningStatusFlag
 		}
 
-		kstatus, err := pkgutil.GetKubeConfigStatus(ip, GetKubeConfigPath(), cfg.GetMachineName())
-		if err != nil {
-			log.Printf("Error kubeconfig status: %v", err)
-			return err
-		}
-		if kstatus {
+		kstatus := kubeconfig.VerifyEndpoint(profile, ip.String(), apiserverPort)
+		//if err != nil {
+		//	log.Printf("Error kubeconfig status: %v", err)
+		//	return err
+		//}
+		if kstatus != nil {
 			ks = "Correctly Configured: pointing to minikube-vm at " + ip.String()
 		} else {
 			ks = "Misconfigured: pointing to stale minikube-vm." +
@@ -326,52 +351,36 @@ func resourceMinikubeRead(d *schema.ResourceData, meta interface{}) error {
 }
 
 func resourceMinikubeCreate(d *schema.ResourceData, meta interface{}) error {
-	machineName := "minikube"
-	apiserverName := d.Get("apiserver_name").(string)
-	cacheImages := d.Get("cache_images").(bool)
-	containerRuntime := d.Get("container_runtime").(string)
-	cpus := d.Get("cpus").(int)
-	disableDriverMounts := d.Get("disable_driver_mounts").(bool)
-	diskSize := d.Get("disk_size").(string)
-	dnsDomain := d.Get("dns_domain").(string)
-	dockerEnv, ok := d.GetOk("docker_env")
-	if !ok {
-		dockerEnv = []string{}
-	}
-	dockerOpt, ok := d.GetOk("docker_opt")
-	if !ok {
-		dockerOpt = []string{}
-	}
-	//extraConfig := d.Get("extra_config").(string)
-	featureGates := d.Get("feature_gates").(string)
-	hostOnlyCIDR := d.Get("host_only_cidr").(string)
-	hypervVirtualSwitch := d.Get("hyperv_virtual_switch").(string)
-	insecureRegistry, ok := d.GetOk("insecure_registry")
-	if !ok {
-		insecureRegistry = []string{"10.0.0.0/24"}
-	}
-	isoURL := d.Get("iso_url").(string)
-	keepContext := d.Get("keep_context").(bool)
-	kubernetesVersion := d.Get("kubernetes_version").(string)
-	kvmNetwork := d.Get("kvm_network").(string)
-	memory := d.Get("memory").(int)
-	mount := d.Get("mount").(bool)
-	mountString := d.Get("mount_string").(string)
-	networkPlugin := d.Get("network_plugin").(string)
-	registryMirror, ok := d.GetOk("registry_mirror")
-	if !ok {
-		registryMirror = []string{}
-	}
-	vmDriver := d.Get("vm_driver").(string)
-	xhyveDiskDriver := d.Get("xhyve_disk_driver").(string)
+	// Load current profile cluster config from file
+	prof, err := cfg.LoadProfile(profile)
+	//  && !os.IsNotExist(err)
 
-	flag.Parse()
-	log.Println("=================== Creating Minikube Cluster ==================")
-	k8sVersion := kubernetesVersion
+	cc := cfg.ClusterConfig{}
 
-	if cacheImages {
-		go machine.CacheImagesForBootstrapper(k8sVersion, clusterBootstrapper, profile)
+	if err != nil {
+		log.Printf("Error loading profile config: %v. Assume that we create cluster first time", err)
+
+		cc, err = getClusterConfigFromResource(d)
+		if err != nil {
+			log.Printf("Error getting DEFAULT cluster config from resource: %s\n", err)
+			return err
+		}
+	} else {
+		cc = *prof.Config
 	}
+
+	nodeConfig := cc.Nodes[0]
+
+	newClusterConfig, err := getClusterConfigFromResource(d)
+	if err != nil {
+		log.Printf("Error getting cluster config from resource: %s\n", err)
+		return err
+	}
+
+	//if cacheImages {
+	//	go machine.CacheImagesForBootstrapper(clusterConfig.KubernetesConfig.ImageRepository,)
+	//}
+
 	api, err := machine.NewAPIClient()
 	if err != nil {
 		log.Printf("Error getting client: %s\n", err)
@@ -379,55 +388,20 @@ func resourceMinikubeCreate(d *schema.ResourceData, meta interface{}) error {
 	}
 	defer api.Close()
 
-	exists, err := api.Exists(machineName)
+	exists, err := api.Exists(newClusterConfig.Name)
 	if err != nil {
 		log.Printf("checking if machine exists: %s", err)
 		return err
 	}
 
-	diskSizeMB := pkgutil.CalculateDiskSizeInMB(diskSize)
-
-	if diskSizeMB < constants.MinimumDiskSizeMB {
-		err := fmt.Errorf("Disk Size %dMB (%s) is too small, the minimum disk size is %dMB", diskSizeMB, diskSize, constants.MinimumDiskSizeMB)
-		log.Printf("Error parsing disk size: %v", err)
-		return err
-	}
-
-	// Don't verify version for kubeadm bootstrapped clusters
-	//if k8sVersion != constants.DefaultKubernetesVersion && clusterBootstrapper != bootstrapper.BootstrapperTypeKubeadm {
-	//	validateK8sVersion(k8sVersion)
+	//if err := saveConfig(interimConfig); err != nil {
+	//	log.Printf("Error saving interim profile cluster configuration: %v", err)
 	//}
 
-	config := cfg.MachineConfig{
-		MinikubeISO:         isoURL,
-		Memory:              memory,
-		CPUs:                cpus,
-		DiskSize:            diskSizeMB,
-		VMDriver:            vmDriver,
-		XhyveDiskDriver:     xhyveDiskDriver,
-		DockerEnv:           dockerEnv.([]string),
-		DockerOpt:           dockerOpt.([]string),
-		InsecureRegistry:    insecureRegistry.([]string),
-		RegistryMirror:      registryMirror.([]string),
-		HostOnlyCIDR:        hostOnlyCIDR,
-		HypervVirtualSwitch: hypervVirtualSwitch,
-		KvmNetwork:          kvmNetwork,
-		Downloader:          pkgutil.DefaultDownloader{},
-		DisableDriverMounts: disableDriverMounts,
-	}
-
-	// Write interim configuration to file
-	interimConfig := cfg.Config{
-		MachineConfig: config,
-	}
-
-	if err := saveConfig(interimConfig); err != nil {
-		log.Printf("Error saving interim profile cluster configuration: %v", err)
-	}
-
-	log.Printf("Starting local Kubernetes %s cluster...\n", kubernetesVersion)
+	log.Printf("Starting local Kubernetes %s cluster...\n", newClusterConfig.KubernetesConfig.KubernetesVersion)
 	log.Println("Starting VM...")
-	host, err := cluster.StartHost(api, config)
+
+	host, _, err := machine.StartHost(api, newClusterConfig, nodeConfig)
 	if err != nil {
 		log.Printf("Error starting host: %v", err)
 		return err
@@ -440,69 +414,43 @@ func resourceMinikubeCreate(d *schema.ResourceData, meta interface{}) error {
 		return err
 	}
 
-	selectedKubernetesVersion := kubernetesVersion
-
-	// Load profile cluster config from file
-	cc, err := loadConfigFromFile(profile)
-	if err != nil && !os.IsNotExist(err) {
-		log.Printf("Error loading profile config: %v", err)
-	}
-	if err == nil {
-		oldKubernetesVersion, err := semver.Make(strings.TrimPrefix(cc.KubernetesConfig.KubernetesVersion, version.VersionPrefix))
-		if err != nil {
-			log.Printf("Error parsing version semver: %v", err)
-		}
-
-		newKubernetesVersion, err := semver.Make(strings.TrimPrefix(kubernetesVersion, version.VersionPrefix))
-		if err != nil {
-			log.Printf("Error parsing version semver: %v", err)
-		}
-
-		// Check if it's an attempt to downgrade version. Avoid version downgrad.
-		if newKubernetesVersion.LT(oldKubernetesVersion) {
-			selectedKubernetesVersion = version.VersionPrefix + oldKubernetesVersion.String()
-			log.Println("Kubernetes version downgrade is not supported. Using version:", selectedKubernetesVersion)
-		}
+	oldKubernetesVersion, err := semver.Make(strings.TrimPrefix(cc.KubernetesConfig.KubernetesVersion, version.VersionPrefix))
+	if err != nil {
+		log.Printf("Error parsing version semver: %v", err)
 	}
 
-	kubernetesConfig := cfg.KubernetesConfig{
-		KubernetesVersion: selectedKubernetesVersion,
-		NodeIP:            ip,
-		NodeName:          cfg.GetMachineName(),
-		APIServerName:     apiserverName,
-		DNSDomain:         dnsDomain,
-		FeatureGates:      featureGates,
-		ContainerRuntime:  containerRuntime,
-		NetworkPlugin:     networkPlugin,
-		ServiceCIDR:       pkgutil.DefaultServiceCIDR,
-		//ExtraOptions:           extraConfig,
-		ShouldLoadCachedImages: cacheImages,
+	newKubernetesVersion, err := semver.Make(strings.TrimPrefix(newClusterConfig.KubernetesConfig.KubernetesVersion, version.VersionPrefix))
+	if err != nil {
+		log.Printf("Error parsing version semver: %v", err)
 	}
 
-	k8sBootstrapper, err := cmd.GetClusterBootstrapper(api, clusterBootstrapper)
+	// Check if it's an attempt to downgrade version. Avoid version downgrad.
+	if newKubernetesVersion.LT(oldKubernetesVersion) {
+		newClusterConfig.KubernetesConfig.KubernetesVersion = version.VersionPrefix + oldKubernetesVersion.String()
+		log.Println("Kubernetes version downgrade is not supported. Using version:", newClusterConfig.KubernetesConfig.KubernetesVersion)
+	}
+
+	log.Printf("Merge old k8s cluster configuration with new one")
+	cc.KubernetesConfig.NodeIP = ip
+	mergo.Merge(&newClusterConfig, cc)
+
+	log.Printf("Save new configuration to %s profile", profile)
+	cfg.SaveProfile(profile, &newClusterConfig)
+
+	k8sBootstrapper, err := cluster.Bootstrapper(api, clusterBootstrapper, newClusterConfig, nodeConfig)
 	if err != nil {
 		log.Printf("Error getting cluster bootstrapper: %s", err)
 		return err
 	}
 
-	// Write profile cluster configuration to file
-	clusterConfig := cfg.Config{
-		MachineConfig:    config,
-		KubernetesConfig: kubernetesConfig,
-	}
-
-	if err := saveConfig(clusterConfig); err != nil {
-		log.Printf("Error saving profile cluster configuration: %v", err)
-	}
-
 	log.Println("Moving files into cluster...")
-	if err := k8sBootstrapper.UpdateCluster(kubernetesConfig); err != nil {
+	if err := k8sBootstrapper.UpdateCluster(newClusterConfig); err != nil {
 		log.Printf("Error updating cluster: %v", err)
 		return err
 	}
 
 	log.Println("Setting up certs...")
-	if err := k8sBootstrapper.SetupCerts(kubernetesConfig); err != nil {
+	if err := k8sBootstrapper.SetupCerts(newClusterConfig.KubernetesConfig, nodeConfig); err != nil {
 		log.Printf("Error configuring authentication: %v", err)
 		return err
 	}
@@ -513,67 +461,69 @@ func resourceMinikubeCreate(d *schema.ResourceData, meta interface{}) error {
 		log.Printf("Error connecting to cluster: %v", err)
 	}
 	kubeHost = strings.Replace(kubeHost, "tcp://", "https://", -1)
-	kubeHost = strings.Replace(kubeHost, ":2376", ":"+strconv.Itoa(pkgutil.APIServerPort), -1)
+	kubeHost = strings.Replace(kubeHost, ":2376", ":"+strconv.Itoa(constants.APIServerPort), -1)
 
 	log.Println("Setting up kubeconfig...")
-	kubeConfigFile := GetKubeConfigPath()
-	kubeCfgSetup := &pkgutil.KubeConfigSetup{
-		ClusterName:          cfg.GetMachineName(),
+	kcs := kubeconfig.Settings{
+		ClusterName:          newClusterConfig.Name,
 		ClusterServerAddress: kubeHost,
-		ClientCertificate:    constants.MakeMiniPath("client.crt"),
-		ClientKey:            constants.MakeMiniPath("client.key"),
-		CertificateAuthority: constants.MakeMiniPath("ca.crt"),
-		KeepContext:          keepContext,
+		ClientCertificate:    localpath.ClientCert(newClusterConfig.Name),
+		CertificateAuthority: localpath.CACert(),
+		ClientKey:            localpath.ClientKey(newClusterConfig.Name),
+		KeepContext:          newClusterConfig.KeepContext,
+		//		EmbedCerts:           false,
 	}
-	kubeCfgSetup.SetKubeConfigFile(kubeConfigFile)
 
-	if err := pkgutil.SetupKubeConfig(kubeCfgSetup); err != nil {
-		log.Printf("Error setting up kubeconfig: %v", err)
+	// write the kubeconfig to the file system after everything required (like certs) are created by the bootstrapper
+	if err := kubeconfig.Update(&kcs); err != nil {
+		log.Printf("Failed to update kubeconfig file.")
 		return err
 	}
 
 	log.Println("Starting cluster components...")
 
 	if !exists {
-		if err := k8sBootstrapper.StartCluster(kubernetesConfig); err != nil {
+		if err := k8sBootstrapper.StartCluster(newClusterConfig); err != nil {
 			log.Printf("Error starting cluster: %v", err)
 			return err
 		}
 	} else {
-		if err := k8sBootstrapper.RestartCluster(kubernetesConfig); err != nil {
-			log.Printf("Error restarting cluster: %v", err)
-			return err
-		}
+		log.Printf("Could not restart cluster. Not implemented yet :-(")
+		return errors.New("could not restart cluster. Not implemented yet")
+		//if err := k8sBootstrapper.RestartCluster(kubernetesConfig); err != nil {
+		//	log.Printf("Error restarting cluster: %v", err)
+		//	return err
+		//}
 	}
 
-	// start 9p server mount
-	if mount {
-		log.Printf("Setting up hostmount on %s...\n", mountString)
+	//// start 9p server mount
+	//if mount {
+	//	log.Printf("Setting up hostmount on %s...\n", mountString)
+	//
+	//	path := os.Args[0]
+	//	mountDebugVal := 0
+	//	mountCmd := exec.Command(path, "mount", fmt.Sprintf("--v=%d", mountDebugVal), mountString)
+	//	mountCmd.Env = append(os.Environ(), constants.IsMinikubeChildProcess+"=true")
+	//	err = mountCmd.Start()
+	//	if err != nil {
+	//		log.Printf("Error running command minikube mount %s", err)
+	//		return err
+	//	}
+	//	err = ioutil.WriteFile(filepath.Join(constants.GetMinipath(), constants.MountProcessFileName), []byte(strconv.Itoa(mountCmd.Process.Pid)), 0644)
+	//	if err != nil {
+	//		log.Printf("Error writing mount process pid to file: %s", err)
+	//		return err
+	//	}
+	//}
 
-		path := os.Args[0]
-		mountDebugVal := 0
-		mountCmd := exec.Command(path, "mount", fmt.Sprintf("--v=%d", mountDebugVal), mountString)
-		mountCmd.Env = append(os.Environ(), constants.IsMinikubeChildProcess+"=true")
-		err = mountCmd.Start()
-		if err != nil {
-			log.Printf("Error running command minikube mount %s", err)
-			return err
-		}
-		err = ioutil.WriteFile(filepath.Join(constants.GetMinipath(), constants.MountProcessFileName), []byte(strconv.Itoa(mountCmd.Process.Pid)), 0644)
-		if err != nil {
-			log.Printf("Error writing mount process pid to file: %s", err)
-			return err
-		}
-	}
-
-	if kubeCfgSetup.KeepContext {
+	if kcs.KeepContext {
 		log.Printf("The local Kubernetes cluster has started. The kubectl context has not been altered, kubectl will require \"--context=%s\" to use the local Kubernetes cluster.\n",
-			kubeCfgSetup.ClusterName)
+			kcs.ClusterName)
 	} else {
 		log.Println("Kubectl is now configured to use the cluster.")
 	}
 
-	if config.VMDriver == "none" {
+	if newClusterConfig.Driver == "none" {
 		log.Println(`===================
 WARNING: IT IS RECOMMENDED NOT TO RUN THE NONE DRIVER ON PERSONAL WORKSTATIONS
 	The 'none' driver will run an insecure kubernetes apiserver as root that may leave the host vulnerable to CSRF attacks
@@ -593,42 +543,161 @@ You will need to move the files to the appropriate location and then set the cor
 
 This can also be done automatically by setting the env var CHANGE_MINIKUBE_NONE_USER=true`)
 		}
-		if err := pkgutil.MaybeChownDirRecursiveToMinikubeUser(constants.GetMinipath()); err != nil {
+		if err := pkgutil.MaybeChownDirRecursiveToMinikubeUser(localpath.MiniPath()); err != nil {
 			log.Printf("Error recursively changing ownership of directory %s: %s",
-				constants.GetMinipath(), err)
+				localpath.MiniPath(), err)
 			return err
 		}
 	}
 
-	log.Println("Loading cached images from config file.")
-	err = cmd.LoadCachedImagesInConfigFile()
-	if err != nil {
-		log.Println("Unable to load cached images from config file.")
-	}
+	//log.Println("Loading cached images from config file.")
+	//err = cmd.LoadCachedImagesInConfigFile()
+	//if err != nil {
+	//	log.Println("Unable to load cached images from config file.")
+	//}
 
-	d.SetId(machineName)
+	d.SetId(nodeConfig.Name)
 
-	client_certificate, err := readFileAsBase64String(kubeCfgSetup.ClientCertificate)
+	clientCertificate, err := readFileAsBase64String(kcs.ClientCertificate)
 	if err != nil {
-		log.Printf("Failed to read client_certificate (%s)", kubeCfgSetup.ClientCertificate)
+		log.Printf("Failed to read client_certificate (%s)", kcs.ClientCertificate)
 		return err
 	}
-	client_key, err := readFileAsBase64String(kubeCfgSetup.ClientKey)
+	clientKey, err := readFileAsBase64String(kcs.ClientKey)
 	if err != nil {
-		log.Printf("Failed to read client_key (%s)", kubeCfgSetup.ClientKey)
+		log.Printf("Failed to read client_key (%s)", kcs.ClientKey)
 		return err
 	}
-	cluster_ca_certificate, err := readFileAsBase64String(kubeCfgSetup.CertificateAuthority)
+	clusterCACertificate, err := readFileAsBase64String(kcs.CertificateAuthority)
 	if err != nil {
-		log.Printf("Failed to read cluster_ca_certificate (%s)", kubeCfgSetup.CertificateAuthority)
+		log.Printf("Failed to read cluster_ca_certificate (%s)", kcs.CertificateAuthority)
 		return err
 	}
 
-	d.Set("client_certificate", client_certificate)
-	d.Set("client_key", client_key)
-	d.Set("cluster_ca_certificate", cluster_ca_certificate)
+	d.Set("client_certificate", clientCertificate)
+	d.Set("client_key", clientKey)
+	d.Set("cluster_ca_certificate", clusterCACertificate)
 	d.Set("endpoint", kubeHost)
 	return err
+}
+
+func getClusterConfigFromResource(d *schema.ResourceData) (cfg.ClusterConfig, error) {
+	machineName := constants.DefaultClusterName
+	apiserverName := d.Get("apiserver_name").(string)
+	cacheImages := d.Get("cache_images").(bool)
+	containerRuntime := d.Get("container_runtime").(string)
+	cpus := d.Get("cpus").(int)
+	disableDriverMounts := d.Get("disable_driver_mounts").(bool)
+	diskSize := d.Get("disk_size").(string)
+	dnsDomain := d.Get("dns_domain").(string)
+	dockerEnv, ok := d.GetOk("docker_env")
+
+	if !ok {
+		dockerEnv = []string{}
+	}
+
+	dockerOpt, ok := d.GetOk("docker_opt")
+	if !ok {
+		dockerOpt = []string{}
+	}
+
+	hypervVirtualSwitch := d.Get("hyperv_virtual_switch").(string)
+	hypervUseExternalSwitch := d.Get("hyperv_use_external_switch").(bool)
+	hypervExternalAdapter := d.Get("hyperv_external_adapter").(string)
+
+	featureGates := d.Get("feature_gates").(string)
+	hostOnlyCIDR := d.Get("host_only_cidr").(string)
+	insecureRegistry, ok := d.GetOk("insecure_registry")
+	if !ok {
+		insecureRegistry = []string{constants.DefaultServiceCIDR}
+	}
+	isoURL := d.Get("iso_url").(string)
+	keepContext := d.Get("keep_context").(bool)
+	kubernetesVersion := d.Get("kubernetes_version").(string)
+	kvmNetwork := d.Get("kvm_network").(string)
+	memory := d.Get("memory").(int)
+	networkPlugin := d.Get("network_plugin").(string)
+	registryMirror, ok := d.GetOk("registry_mirror")
+	if !ok {
+		registryMirror = []string{}
+	}
+	vmDriver := d.Get("driver").(string)
+
+	addons, ok := d.Get("addons").(map[string]bool)
+	if !ok {
+		addons = map[string]bool{}
+	}
+
+	extraOptionsStr := d.Get("extra_options").(string)
+
+	extraOptions := cfg.ExtraOptionSlice{}
+	err := extraOptions.Set(extraOptionsStr)
+	if err != nil {
+		log.Printf("Error parsing extra options: %v", err)
+		return cfg.ClusterConfig{}, err
+	}
+
+	diskSizeMB, err := pkgutil.CalculateSizeInMB(viper.GetString(diskSize))
+
+	if err != nil {
+		log.Printf("Error parsing disk size: %v", err)
+		return cfg.ClusterConfig{}, err
+	}
+
+	if diskSizeMB < minimumDiskSizeInMB {
+		err := fmt.Errorf("Disk Size %dMB (%s) is too small, the minimum disk size is %dMB", diskSizeMB, diskSize, minimumDiskSizeInMB)
+		return cfg.ClusterConfig{}, err
+	}
+
+	flag.Parse()
+	//log.Println("=================== Creating Minikube Cluster ==================")
+	nodeConfig := cfg.Node{
+		Name:              machineName,
+		KubernetesVersion: kubernetesVersion,
+	}
+
+	kubeConfig := cfg.KubernetesConfig{
+		KubernetesVersion:      kubernetesVersion,
+		ClusterName:            machineName,
+		APIServerName:          apiserverName,
+		DNSDomain:              dnsDomain,
+		ContainerRuntime:       containerRuntime,
+		NetworkPlugin:          networkPlugin,
+		FeatureGates:           featureGates,
+		ServiceCIDR:            constants.DefaultServiceCIDR,
+		ExtraOptions:           extraOptions,
+		ShouldLoadCachedImages: cacheImages,
+		EnableDefaultCNI:       false,
+		//NodeIP:                 ip,
+		//NodePort:               0,
+		NodeName: machineName,
+	}
+
+	// https://pkg.go.dev/k8s.io/minikube/pkg/minikube/config?tab=doc#ClusterConfig
+	config := cfg.ClusterConfig{
+		Name:                    machineName,
+		KeepContext:             keepContext,
+		MinikubeISO:             isoURL,
+		Memory:                  memory,
+		CPUs:                    cpus,
+		DiskSize:                diskSizeMB,
+		Driver:                  vmDriver,
+		DockerEnv:               dockerEnv.([]string),
+		InsecureRegistry:        insecureRegistry.([]string),
+		RegistryMirror:          registryMirror.([]string),
+		HostOnlyCIDR:            hostOnlyCIDR, // Only used by the virtualbox driver
+		HypervVirtualSwitch:     hypervVirtualSwitch,
+		HypervUseExternalSwitch: hypervUseExternalSwitch,
+		HypervExternalAdapter:   hypervExternalAdapter,
+		KVMNetwork:              kvmNetwork,           // Only used by the KVM driver
+		DockerOpt:               dockerOpt.([]string), // Each entry is formatted as KEY=VALUE.
+		DisableDriverMounts:     disableDriverMounts,  // Only used by virtualbox
+		KubernetesConfig:        kubeConfig,
+		Nodes:                   []cfg.Node{nodeConfig},
+		Addons:                  addons,
+	}
+
+	return config, nil
 }
 
 func readFileAsBase64String(path string) (string, error) {
@@ -641,6 +710,13 @@ func readFileAsBase64String(path string) (string, error) {
 
 func resourceMinikubeDelete(d *schema.ResourceData, _ interface{}) error {
 	log.Println("Deleting local Kubernetes cluster...")
+
+	config, err := getClusterConfigFromResource(d)
+	if err != nil {
+		log.Printf("Error getting cluster config: %s\n", err)
+		return err
+	}
+
 	api, err := machine.NewAPIClient()
 	if err != nil {
 		log.Printf("Error getting client: %s\n", err)
@@ -648,17 +724,17 @@ func resourceMinikubeDelete(d *schema.ResourceData, _ interface{}) error {
 	}
 	defer api.Close()
 
-	if err = cluster.DeleteHost(api); err != nil {
+	if err = machine.DeleteHost(api, config.Nodes[0].Name); err != nil {
 		log.Println("Errors occurred deleting machine: ", err)
 		return err
 	}
 	fmt.Println("Machine deleted.")
 
-	if err := KillMountProcess(); err != nil {
-		log.Println("Errors occurred deleting mount process: ", err)
-	}
+	//if err := KillMountProcess(); err != nil {
+	//	log.Println("Errors occurred deleting mount process: ", err)
+	//}
 
-	if err := os.Remove(constants.GetProfileFile(profile)); err != nil {
+	if err := cfg.DeleteProfile(profile); err != nil {
 		log.Println("Error deleting machine profile config")
 		return err
 	}
@@ -666,72 +742,72 @@ func resourceMinikubeDelete(d *schema.ResourceData, _ interface{}) error {
 	return nil
 }
 
-func loadConfigFromFile(profile string) (cfg.Config, error) {
-	var cc cfg.Config
-
-	profileConfigFile := constants.GetProfileFile(profile)
-
-	if _, err := os.Stat(profileConfigFile); os.IsNotExist(err) {
-		return cc, err
-	}
-
-	data, err := ioutil.ReadFile(profileConfigFile)
-	if err != nil {
-		return cc, err
-	}
-
-	if err := json.Unmarshal(data, &cc); err != nil {
-		return cc, err
-	}
-	return cc, nil
-}
-
-// saveConfig saves profile cluster configuration in
-// $MINIKUBE_HOME/profiles/<profilename>/config.json
-func saveConfig(clusterConfig cfg.Config) error {
-	data, err := json.MarshalIndent(clusterConfig, "", "    ")
-	if err != nil {
-		return err
-	}
-
-	profileConfigFile := constants.GetProfileFile(profile)
-
-	if err := os.MkdirAll(filepath.Dir(profileConfigFile), 0700); err != nil {
-		return err
-	}
-
-	if err := saveConfigToFile(data, profileConfigFile); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func saveConfigToFile(data []byte, file string) error {
-	if _, err := os.Stat(file); os.IsNotExist(err) {
-		return ioutil.WriteFile(file, data, 0600)
-	}
-
-	tmpfi, err := ioutil.TempFile(filepath.Dir(file), "config.json.tmp")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmpfi.Name())
-
-	if err = ioutil.WriteFile(tmpfi.Name(), data, 0600); err != nil {
-		return err
-	}
-
-	if err = tmpfi.Close(); err != nil {
-		return err
-	}
-
-	if err = os.Remove(file); err != nil {
-		return err
-	}
-
-	if err = os.Rename(tmpfi.Name(), file); err != nil {
-		return err
-	}
-	return nil
-}
+//func loadConfigFromFile(profile string) (cfg.Config, error) {
+//	var cc cfg.Config
+//
+//	profileConfigFile := constants.GetProfileFile(profile)
+//
+//	if _, err := os.Stat(profileConfigFile); os.IsNotExist(err) {
+//		return cc, err
+//	}
+//
+//	data, err := ioutil.ReadFile(profileConfigFile)
+//	if err != nil {
+//		return cc, err
+//	}
+//
+//	if err := json.Unmarshal(data, &cc); err != nil {
+//		return cc, err
+//	}
+//	return cc, nil
+//}
+//
+//// saveConfig saves profile cluster configuration in
+//// $MINIKUBE_HOME/profiles/<profilename>/config.json
+//func saveConfig(clusterConfig cfg.Config) error {
+//	data, err := json.MarshalIndent(clusterConfig, "", "    ")
+//	if err != nil {
+//		return err
+//	}
+//
+//	profileConfigFile := constants.GetProfileFile(profile)
+//
+//	if err := os.MkdirAll(filepath.Dir(profileConfigFile), 0700); err != nil {
+//		return err
+//	}
+//
+//	if err := saveConfigToFile(data, profileConfigFile); err != nil {
+//		return err
+//	}
+//
+//	return nil
+//}
+//
+//func saveConfigToFile(data []byte, file string) error {
+//	if _, err := os.Stat(file); os.IsNotExist(err) {
+//		return ioutil.WriteFile(file, data, 0600)
+//	}
+//
+//	tmpfi, err := ioutil.TempFile(filepath.Dir(file), "config.json.tmp")
+//	if err != nil {
+//		return err
+//	}
+//	defer os.Remove(tmpfi.Name())
+//
+//	if err = ioutil.WriteFile(tmpfi.Name(), data, 0600); err != nil {
+//		return err
+//	}
+//
+//	if err = tmpfi.Close(); err != nil {
+//		return err
+//	}
+//
+//	if err = os.Remove(file); err != nil {
+//		return err
+//	}
+//
+//	if err = os.Rename(tmpfi.Name(), file); err != nil {
+//		return err
+//	}
+//	return nil
+//}
