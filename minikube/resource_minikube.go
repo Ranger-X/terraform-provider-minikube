@@ -517,6 +517,12 @@ func resourceMinikubeCreate(d *schema.ResourceData, meta interface{}) error {
 		return err
 	}
 
+	// set (new) external IP of cluster node
+	newClusterConfig.KubernetesConfig.NodeIP = ip
+	newClusterConfig.Nodes[0].IP = ip
+	// is this same thing?
+	nodeConfig.IP = ip
+
 	if existing != nil {
 		oldKubernetesVersion, err := semver.Make(strings.TrimPrefix(existing.KubernetesConfig.KubernetesVersion, version.VersionPrefix))
 		if err != nil {
@@ -557,7 +563,7 @@ func resourceMinikubeCreate(d *schema.ResourceData, meta interface{}) error {
 		return err
 	}
 
-	log.Println("Moving files into cluster...")
+	log.Println("Update cluster configuration...")
 	if err := k8sBootstrapper.UpdateCluster(newClusterConfig); err != nil {
 		log.Printf("Error updating cluster: %v", err)
 		return err
@@ -732,10 +738,12 @@ func getClusterConfigFromResource(d *schema.ResourceData) (cfg.ClusterConfig, er
 	extraOptionsStr := d.Get("extra_options").(string)
 
 	extraOptions := cfg.ExtraOptionSlice{}
-	err := extraOptions.Set(extraOptionsStr)
-	if err != nil {
-		log.Printf("Error parsing extra options: %v", err)
-		return cfg.ClusterConfig{}, err
+	if extraOptionsStr != "" {
+		err := extraOptions.Set(extraOptionsStr)
+		if err != nil {
+			log.Printf("Error parsing extra options: %v", err)
+			return cfg.ClusterConfig{}, err
+		}
 	}
 
 	diskSizeMB, err := pkgutil.CalculateSizeInMB(diskSize)
@@ -754,9 +762,9 @@ func getClusterConfigFromResource(d *schema.ResourceData) (cfg.ClusterConfig, er
 	nodeConfig := cfg.Node{
 		Name:              machineName,
 		KubernetesVersion: kubernetesVersion,
-		ControlPlane:      true,
-		Worker:            true,
-		IP:                "127.0.0.1",
+		//ControlPlane:      true,
+		//Worker:            true,
+		//IP:                "127.0.0.1",
 	}
 
 	kubeConfig := cfg.KubernetesConfig{
