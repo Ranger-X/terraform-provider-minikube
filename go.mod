@@ -9,6 +9,7 @@ require (
 	github.com/docker/machine v0.16.2
 	github.com/hashicorp/terraform v0.12.24
 	github.com/imdario/mergo v0.3.9
+	github.com/jteeuwen/go-bindata v3.0.7+incompatible // indirect
 	github.com/spf13/viper v1.3.2
 	k8s.io/minikube v1.9.2
 )

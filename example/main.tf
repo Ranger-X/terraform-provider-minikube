@@ -3,8 +3,8 @@ provider "minikube" {
 
 resource "minikube" "cluster" {
   //  disk_size = "20g"
-  vm_driver          = "virtualbox"
-  kubernetes_version = "v1.15.0"
+  driver             = "virtualbox"
+  kubernetes_version = "v1.17.0"
   keep_context       = false
   cache_images       = false
 }
