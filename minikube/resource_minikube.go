@@ -1,6 +1,7 @@
 package minikube
 
 import (
+	"bytes"
 	b64 "encoding/base64"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"text/template"
 
 	"github.com/blang/semver"
 	"github.com/docker/machine/libmachine/state"
@@ -42,13 +44,152 @@ var (
 	clusterBootstrapper string = bootstrapper.Kubeadm
 	profile             string = constants.DefaultClusterName
 	minimumDiskSizeInMB int    = 3000
+	// PSPyml is config template for create PodSecurityPolicy roles and bindings if PSP enabled for minikube
+	// based on https://minikube.sigs.k8s.io/docs/tutorials/using_psp/
+	PSPyml = template.Must(template.New("PSPYml-addon").Parse(`apiVersion: policy/v1beta1
+kind: PodSecurityPolicy
+metadata:
+  name: privileged
+  annotations:
+    seccomp.security.alpha.kubernetes.io/allowedProfileNames: "*"
+  labels:
+    addonmanager.kubernetes.io/mode: EnsureExists
+spec:
+  privileged: true
+  allowPrivilegeEscalation: true
+  allowedCapabilities:
+  - "*"
+  volumes:
+  - "*"
+  hostNetwork: true
+  hostPorts:
+  - min: 0
+    max: 65535
+  hostIPC: true
+  hostPID: true
+  runAsUser:
+    rule: 'RunAsAny'
+  seLinux:
+    rule: 'RunAsAny'
+  supplementalGroups:
+    rule: 'RunAsAny'
+  fsGroup:
+    rule: 'RunAsAny'
+---
+apiVersion: policy/v1beta1
+kind: PodSecurityPolicy
+metadata:
+  name: restricted
+  labels:
+    addonmanager.kubernetes.io/mode: EnsureExists
+spec:
+  privileged: false
+  allowPrivilegeEscalation: false
+  requiredDropCapabilities:
+    - ALL
+  volumes:
+    - 'configMap'
+    - 'emptyDir'
+    - 'projected'
+    - 'secret'
+    - 'downwardAPI'
+    - 'persistentVolumeClaim'
+  hostNetwork: false
+  hostIPC: false
+  hostPID: false
+  runAsUser:
+    rule: 'MustRunAsNonRoot'
+  seLinux:
+    rule: 'RunAsAny'
+  supplementalGroups:
+    rule: 'MustRunAs'
+    ranges:
+      # Forbid adding the root group.
+      - min: 1
+        max: 65535
+  fsGroup:
+    rule: 'MustRunAs'
+    ranges:
+      # Forbid adding the root group.
+      - min: 1
+        max: 65535
+  readOnlyRootFilesystem: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: psp:privileged
+  labels:
+    addonmanager.kubernetes.io/mode: EnsureExists
+rules:
+- apiGroups: ['policy']
+  resources: ['podsecuritypolicies']
+  verbs:     ['use']
+  resourceNames:
+  - privileged
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: psp:restricted
+  labels:
+    addonmanager.kubernetes.io/mode: EnsureExists
+rules:
+- apiGroups: ['policy']
+  resources: ['podsecuritypolicies']
+  verbs:     ['use']
+  resourceNames:
+  - restricted
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: default:restricted
+  labels:
+    addonmanager.kubernetes.io/mode: EnsureExists
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: psp:restricted
+subjects:
+- kind: Group
+  name: system:authenticated
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: default:privileged
+  namespace: kube-system
+  labels:
+    addonmanager.kubernetes.io/mode: EnsureExists
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: psp:privileged
+subjects:
+- kind: Group
+  name: system:masters
+  apiGroup: rbac.authorization.k8s.io
+- kind: Group
+  name: system:nodes
+  apiGroup: rbac.authorization.k8s.io
+- kind: Group
+  name: system:serviceaccounts:kube-system
+  apiGroup: rbac.authorization.k8s.io
+`))
 )
+
+type CustomConfig struct {
+	PSP bool // enable PodSecurityPolicy
+}
 
 func resourceMinikube() *schema.Resource {
 	return &schema.Resource{
 		Create: resourceMinikubeCreate,
 		Read:   resourceMinikubeRead,
 		Delete: resourceMinikubeDelete,
+
 		// https://github.com/kubernetes/minikube/blob/e098a3c4ca91f7907705a99e4e3466868afca482/cmd/minikube/cmd/start_flags.go
 		Schema: map[string]*schema.Schema{
 			"addons": &schema.Schema{
@@ -287,6 +428,13 @@ Valid components are: kubelet, apiserver, controller-manager, etcd, proxy, sched
 				ForceNew:    true,
 				Optional:    true,
 			},
+			"pod_security_policy": &schema.Schema{
+				Type:        schema.TypeBool,
+				Description: "Enable PodSecurityPolicy (PSP) inside minikube (default: false)",
+				Default:     false,
+				ForceNew:    true,
+				Optional:    true,
+			},
 			"registry_mirror": &schema.Schema{
 				Type:        schema.TypeList,
 				Description: "Registry mirrors to pass to the Docker daemon",
@@ -337,9 +485,11 @@ func resourceMinikubeRead(d *schema.ResourceData, meta interface{}) error {
 	}
 	defer api.Close()
 
-	hostSt, err := machine.Status(api, profile)
+	profileName := d.Id()
+
+	hostSt, err := machine.Status(api, profileName)
 	if err != nil {
-		log.Printf("Error getting host status: %v", err)
+		log.Printf("Error getting host status for %s: %+v", profileName, err)
 		return err
 	}
 
@@ -347,31 +497,30 @@ func resourceMinikubeRead(d *schema.ResourceData, meta interface{}) error {
 	apiserverSt := state.None.String()
 	ks := state.None.String()
 
-	clusterConfig, err := getClusterConfigFromResource(d)
+	clusterConfig, _, err := getClusterConfigFromResource(d)
 	if err != nil {
-		log.Printf("Error getting minikube cluster config from terraform resource: %s", err)
+		log.Printf("Error getting minikube cluster config from terraform resource: %+v", err)
 		return err
 	}
 
 	nodeConfig := clusterConfig.Nodes[0]
-	nodeName := nodeConfig.Name
 
 	if hostSt == state.Running.String() {
 
 		clusterBootstrapper, err := cluster.Bootstrapper(api, clusterBootstrapper, clusterConfig, nodeConfig)
 		if err != nil {
-			log.Printf("Error getting cluster bootstrapper: %s", err)
+			log.Printf("Error getting cluster bootstrapper: %+v", err)
 			return err
 		}
 		kubeletSt, err = clusterBootstrapper.GetKubeletStatus()
 		if err != nil {
-			log.Printf("Error kubelet status: %v", err)
+			log.Printf("Error kubelet status: %+v", err)
 			return err
 		}
 
-		ip, err := cluster.GetHostDriverIP(api, nodeName)
+		ip, err := cluster.GetHostDriverIP(api, profileName)
 		if err != nil {
-			log.Printf("Error host driver ip status: %v", err)
+			log.Printf("Error host driver ip status: %+v", err)
 			return err
 		}
 
@@ -380,13 +529,13 @@ func resourceMinikubeRead(d *schema.ResourceData, meta interface{}) error {
 		apiserverSt, err = clusterBootstrapper.GetAPIServerStatus(ip.String(), apiserverPort)
 		returnCode := 0
 		if err != nil {
-			log.Printf("Error api-server status: %v", err)
+			log.Printf("Error api-server status: %+v", err)
 			return err
 		} else if apiserverSt != state.Running.String() {
 			returnCode |= clusterNotRunningStatusFlag
 		}
 
-		kstatus := kubeconfig.VerifyEndpoint(profile, ip.String(), apiserverPort)
+		kstatus := kubeconfig.VerifyEndpoint(profileName, ip.String(), apiserverPort)
 		//if err != nil {
 		//	log.Printf("Error kubeconfig status: %v", err)
 		//	return err
@@ -400,12 +549,21 @@ func resourceMinikubeRead(d *schema.ResourceData, meta interface{}) error {
 	}
 
 	status := cmd.Status{
+		Name:       profileName,
 		Host:       hostSt,
 		Kubelet:    kubeletSt,
 		APIServer:  apiserverSt,
 		Kubeconfig: ks,
+		Worker:     false,
 	}
-	log.Printf("Result: %v", status)
+	log.Printf("resourceMinikubeRead result: %+v", status)
+
+	if kubeletSt == state.None.String() || apiserverSt == state.None.String() || ks == state.None.String() {
+		// If the resource does not exist, inform Terraform. We want to immediately
+		// return here to prevent further processing.
+		d.SetId("")
+		return nil
+	}
 
 	return nil
 }
@@ -429,7 +587,7 @@ func resourceMinikubeCreate(d *schema.ResourceData, meta interface{}) error {
 	//	cc = *prof.Config
 	//}
 
-	newClusterConfig, err := getClusterConfigFromResource(d)
+	newClusterConfig, customConfig, err := getClusterConfigFromResource(d)
 	if err != nil {
 		log.Printf("Error getting cluster config from resource: %s\n", err)
 		return err
@@ -502,6 +660,24 @@ func resourceMinikubeCreate(d *schema.ResourceData, meta interface{}) error {
 	if err := cfg.Write(profileName, &newClusterConfig); err != nil {
 		log.Printf("Could not save current config to %s: %v", profileFilePath(profileName), err)
 		return err
+	}
+
+	if customConfig.PSP {
+		log.Printf("Preparing for enable PodSecurityPolicy in minikube...")
+		if err := preparePSP(); err != nil {
+			log.Printf("cannot prepare PSP YAML: %+v", err)
+			return err
+		}
+
+		// add option to enable PSP
+		e := cfg.ExtraOption{
+			Component: "apiserver",
+			Key:       "enable-admission-plugins",
+			Value:     "PodSecurityPolicy",
+		}
+
+		es := &(newClusterConfig.KubernetesConfig.ExtraOptions)
+		*es = append(*es, e)
 	}
 
 	host, _, err := machine.StartHost(api, newClusterConfig, nodeConfig)
@@ -668,7 +844,7 @@ This can also be done automatically by setting the env var CHANGE_MINIKUBE_NONE_
 	//	log.Println("Unable to load cached images from config file.")
 	//}
 
-	d.SetId(nodeConfig.Name)
+	d.SetId(profileName)
 
 	clientCertificate, err := readFileAsBase64String(kcs.ClientCertificate)
 	if err != nil {
@@ -690,10 +866,15 @@ This can also be done automatically by setting the env var CHANGE_MINIKUBE_NONE_
 	d.Set("client_key", clientKey)
 	d.Set("cluster_ca_certificate", clusterCACertificate)
 	d.Set("endpoint", kubeHost)
-	return err
+
+	return resourceMinikubeRead(d, meta)
 }
 
-func getClusterConfigFromResource(d *schema.ResourceData) (cfg.ClusterConfig, error) {
+func getClusterConfigFromResource(d *schema.ResourceData) (cfg.ClusterConfig, CustomConfig, error) {
+	customConfig := CustomConfig{
+		PSP: false,
+	}
+
 	machineName := constants.DefaultClusterName
 
 	apiserverName := d.Get("apiserver_name").(string)
@@ -727,6 +908,7 @@ func getClusterConfigFromResource(d *schema.ResourceData) (cfg.ClusterConfig, er
 	memory := d.Get("memory").(int)
 	natNicType := d.Get("nat_nic_type").(string)
 	networkPlugin := d.Get("network_plugin").(string)
+	psp := d.Get("pod_security_policy").(bool)
 	registryMirror := d.Get("registry_mirror")
 	vmDriver := d.Get("driver").(string)
 
@@ -742,20 +924,27 @@ func getClusterConfigFromResource(d *schema.ResourceData) (cfg.ClusterConfig, er
 		err := extraOptions.Set(extraOptionsStr)
 		if err != nil {
 			log.Printf("Error parsing extra options: %v", err)
-			return cfg.ClusterConfig{}, err
+			return cfg.ClusterConfig{}, customConfig, err
+		}
+
+		if strings.EqualFold(extraOptions.Get("enable-admission-plugins"), "PodSecurityPolicy") {
+			log.Printf("For some reasons, 'enable-admission-plugins=PodSecurityPolicy' specified in extra_options cause Minikube bootstrap to hang, so you should use a 'pod_security_policy=true' instead if you want PSP.")
+			return cfg.ClusterConfig{}, customConfig, errors.New("for some reasons, 'enable-admission-plugins=PodSecurityPolicy' specified in extra_options cause Minikube bootstrap to hang, so you should use a 'pod_security_policy=true' instead if you want PSP")
 		}
 	}
+	// set PSP option
+	customConfig.PSP = psp
 
 	diskSizeMB, err := pkgutil.CalculateSizeInMB(diskSize)
 
 	if err != nil {
 		log.Printf("Error parsing disk size %s: %v", diskSize, err)
-		return cfg.ClusterConfig{}, err
+		return cfg.ClusterConfig{}, customConfig, err
 	}
 
 	if diskSizeMB < minimumDiskSizeInMB {
 		err := fmt.Errorf("Disk Size %dMB (%s) is too small, the minimum disk size is %dMB", diskSizeMB, diskSize, minimumDiskSizeInMB)
-		return cfg.ClusterConfig{}, err
+		return cfg.ClusterConfig{}, customConfig, err
 	}
 
 	//log.Println("=================== Creating Minikube Cluster ==================")
@@ -817,7 +1006,7 @@ func getClusterConfigFromResource(d *schema.ResourceData) (cfg.ClusterConfig, er
 
 	log.Printf("clusterConfig: %v", conf)
 
-	return conf, nil
+	return conf, customConfig, nil
 }
 
 func readFileAsBase64String(path string) (string, error) {
@@ -831,7 +1020,7 @@ func readFileAsBase64String(path string) (string, error) {
 func resourceMinikubeDelete(d *schema.ResourceData, _ interface{}) error {
 	log.Println("Deleting local Kubernetes cluster...")
 
-	config, err := getClusterConfigFromResource(d)
+	config, _, err := getClusterConfigFromResource(d)
 	if err != nil {
 		log.Printf("Error getting cluster config: %s\n", err)
 		return err
@@ -844,7 +1033,7 @@ func resourceMinikubeDelete(d *schema.ResourceData, _ interface{}) error {
 	}
 	defer api.Close()
 
-	if err = machine.DeleteHost(api, config.Nodes[0].Name); err != nil {
+	if err = machine.DeleteHost(api, config.Name); err != nil {
 		log.Println("Errors occurred deleting machine: ", err)
 		return err
 	}
@@ -1010,4 +1199,27 @@ func profileFilePath(profile string, miniHome ...string) string {
 	}
 
 	return filepath.Join(miniPath, "profiles", profile, "config.json")
+}
+
+func preparePSP() error {
+	var policiesContent bytes.Buffer
+	opts := struct{}{}
+
+	if err := PSPyml.Execute(&policiesContent, opts); err != nil {
+		log.Printf("cannot template PSP: %+v", err)
+		return err
+	}
+
+	addonsFolder := localpath.MakeMiniPath("files", "etc", "kubernetes", "addons")
+
+	if err := os.MkdirAll(addonsFolder, 0755); err != nil {
+		log.Printf("error creating minikube addons directory '%s': %v", addonsFolder, err)
+		return err
+	}
+
+	addonsPath := []string{addonsFolder}
+	addonsPath = append(addonsPath, "psp.yaml")
+	policiesFilePath := filepath.Join(addonsPath...)
+
+	return ioutil.WriteFile(policiesFilePath, policiesContent.Bytes(), 0644)
 }
