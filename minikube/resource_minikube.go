@@ -14,16 +14,13 @@ import (
 	"strings"
 	"text/template"
 
-	"github.com/blang/semver"
 	"github.com/docker/machine/libmachine/state"
 	"github.com/hashicorp/terraform/helper/schema"
-	"github.com/imdario/mergo"
 	"k8s.io/minikube/cmd/minikube/cmd"
 	"k8s.io/minikube/pkg/minikube/bootstrapper"
 	"k8s.io/minikube/pkg/minikube/cluster"
 	cfg "k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
-	"k8s.io/minikube/pkg/minikube/download"
 	"k8s.io/minikube/pkg/minikube/driver"
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/kubeconfig"
@@ -35,15 +32,12 @@ import (
 	// Register drivers
 	_ "k8s.io/minikube/pkg/minikube/registry/drvs"
 	pkgutil "k8s.io/minikube/pkg/util"
-	"k8s.io/minikube/pkg/version"
 )
 
 const clusterNotRunningStatusFlag = 1 << 1
 
 var (
-	clusterBootstrapper string = bootstrapper.Kubeadm
-	profile             string = constants.DefaultClusterName
-	minimumDiskSizeInMB int    = 3000
+	minimumDiskSizeInMB int = 3000
 	// PSPyml is config template for create PodSecurityPolicy roles and bindings if PSP enabled for minikube
 	// based on https://minikube.sigs.k8s.io/docs/tutorials/using_psp/
 	PSPyml = template.Must(template.New("PSPYml-addon").Parse(`apiVersion: policy/v1beta1
@@ -181,7 +175,12 @@ subjects:
 )
 
 type CustomConfig struct {
-	PSP bool // enable PodSecurityPolicy
+	Bootstrapper  string // name of cluster bootstrapper
+	CacheImages   bool   // cache images
+	InstallAddons bool   // install addons into minikube
+	Preload       bool   // If set, download tarball of preloaded images if available to improve start time. Defaults to true.
+	ProfileName   string // profile (cluster) name
+	PSP           bool   // enable PodSecurityPolicy
 }
 
 func resourceMinikube() *schema.Resource {
@@ -336,6 +335,13 @@ Valid components are: kubelet, apiserver, controller-manager, etcd, proxy, sched
 					return []string{constants.DefaultServiceCIDR}, nil
 				},
 			},
+			"install_addons": &schema.Schema{
+				Type:        schema.TypeBool,
+				Description: "If set, install addons. Defaults to true",
+				Default:     true,
+				ForceNew:    true,
+				Optional:    true,
+			},
 			"iso_skip_checksum": &schema.Schema{
 				Type:        schema.TypeBool,
 				Description: "Skip minikube ISO checksum verification on download (default: false)",
@@ -435,6 +441,13 @@ Valid components are: kubelet, apiserver, controller-manager, etcd, proxy, sched
 				ForceNew:    true,
 				Optional:    true,
 			},
+			"preload": &schema.Schema{
+				Type:        schema.TypeBool,
+				Description: "If set, download tarball of preloaded images if available to improve start time. Defaults to true",
+				Default:     true,
+				ForceNew:    true,
+				Optional:    true,
+			},
 			"registry_mirror": &schema.Schema{
 				Type:        schema.TypeList,
 				Description: "Registry mirrors to pass to the Docker daemon",
@@ -480,8 +493,7 @@ Valid components are: kubelet, apiserver, controller-manager, etcd, proxy, sched
 func resourceMinikubeRead(d *schema.ResourceData, meta interface{}) error {
 	api, err := machine.NewAPIClient()
 	if err != nil {
-		log.Printf("Error getting client: %s\n", err)
-		return err
+		return fmt.Errorf("Error getting client: %s\n", err)
 	}
 	defer api.Close()
 
@@ -497,7 +509,7 @@ func resourceMinikubeRead(d *schema.ResourceData, meta interface{}) error {
 	apiserverSt := state.None.String()
 	ks := state.None.String()
 
-	clusterConfig, _, err := getClusterConfigFromResource(d)
+	clusterConfig, customConfig, err := getClusterConfigFromResource(d)
 	if err != nil {
 		log.Printf("Error getting minikube cluster config from terraform resource: %+v", err)
 		return err
@@ -507,7 +519,7 @@ func resourceMinikubeRead(d *schema.ResourceData, meta interface{}) error {
 
 	if hostSt == state.Running.String() {
 
-		clusterBootstrapper, err := cluster.Bootstrapper(api, clusterBootstrapper, clusterConfig, nodeConfig)
+		clusterBootstrapper, err := cluster.Bootstrapper(api, customConfig.Bootstrapper, clusterConfig, nodeConfig)
 		if err != nil {
 			log.Printf("Error getting cluster bootstrapper: %+v", err)
 			return err
@@ -601,13 +613,9 @@ func resourceMinikubeCreate(d *schema.ResourceData, meta interface{}) error {
 		return err
 	}
 
-	skipISOChecksum := d.Get("iso_skip_checksum").(bool)
+	//skipISOChecksum := d.Get("iso_skip_checksum").(bool)
 
 	nodeConfig := newClusterConfig.Nodes[0]
-
-	//if cacheImages {
-	//	go machine.CacheImagesForBootstrapper(clusterConfig.KubernetesConfig.ImageRepository,)
-	//}
 
 	api, err := machine.NewAPIClient()
 	if err != nil {
@@ -616,51 +624,39 @@ func resourceMinikubeCreate(d *schema.ResourceData, meta interface{}) error {
 	}
 	defer api.Close()
 
-	//exists, err := api.Exists(profileName)
-	//if err != nil {
-	//	log.Printf("checking if machine exists: %s", err)
-	//	return err
-	//}
-
 	log.Printf("Starting local Kubernetes %s cluster...\n", newClusterConfig.KubernetesConfig.KubernetesVersion)
 
 	log.Printf("clusterConfig: %+v", newClusterConfig)
 	log.Printf("nodeConfig: %+v", nodeConfig)
-
-	log.Println("Starting VM...")
 
 	validateSpecifiedDriver(existing, newClusterConfig.Driver)
 	ds := selectDriver(existing, newClusterConfig)
 	driverName := ds.Name
 	log.Printf("selected driver: %s", driverName)
 	validateDriver(ds, existing)
-	//err = autoSetDriverOptions(cmd, driverName)
-	//if err != nil {
-	//	log.Printf("Error autoSetOptions : %v", err)
+
+	//if driver.IsVM(driverName) {
+	//	urls := []string{newClusterConfig.MinikubeISO}
+	//	urls = append(urls, download.DefaultISOURLs()...)
+	//
+	//	url, err := download.ISO(urls, skipISOChecksum)
+	//	if err != nil {
+	//		log.Printf("Failed to cache ISO: %v", err)
+	//		return err
+	//	}
+	//	newClusterConfig.MinikubeISO = url
 	//}
 
-	if driver.IsVM(driverName) {
-		urls := []string{newClusterConfig.MinikubeISO}
-		urls = append(urls, download.DefaultISOURLs()...)
-
-		url, err := download.ISO(urls, skipISOChecksum)
-		if err != nil {
-			log.Printf("Failed to cache ISO: %v", err)
-			return err
-		}
-		newClusterConfig.MinikubeISO = url
-	}
-
-	log.Printf("Save current/new configuration to %s because we need it before VM start", profileName)
-	if err := os.MkdirAll(cfg.ProfileFolderPath(profileName), 0777); err != nil {
-		log.Printf("error creating profile directory '%s': %v", cfg.ProfileFolderPath(profileName), err)
-		return err
-	}
-
-	if err := cfg.Write(profileName, &newClusterConfig); err != nil {
-		log.Printf("Could not save current config to %s: %v", profileFilePath(profileName), err)
-		return err
-	}
+	//log.Printf("Save current/new configuration to %s because we need it before VM start", profileName)
+	//if err := os.MkdirAll(cfg.ProfileFolderPath(profileName), 0777); err != nil {
+	//	log.Printf("error creating profile directory '%s': %v", cfg.ProfileFolderPath(profileName), err)
+	//	return err
+	//}
+	//
+	//if err := cfg.Write(profileName, &newClusterConfig); err != nil {
+	//	log.Printf("Could not save current config to %s: %v", profileFilePath(profileName), err)
+	//	return err
+	//}
 
 	if customConfig.PSP {
 		log.Printf("Preparing for enable PodSecurityPolicy in minikube...")
@@ -680,109 +676,123 @@ func resourceMinikubeCreate(d *schema.ResourceData, meta interface{}) error {
 		*es = append(*es, e)
 	}
 
-	host, _, err := machine.StartHost(api, newClusterConfig, nodeConfig)
+	var existingAddons map[string]bool
+	if customConfig.InstallAddons {
+		existingAddons = map[string]bool{}
+		if existing != nil && existing.Addons != nil {
+			existingAddons = existing.Addons
+		}
+	}
+
+	kcs, host, err := Start(newClusterConfig, nodeConfig, customConfig, existingAddons)
 	if err != nil {
-		log.Printf("Error starting host: %v", err)
+		log.Printf("Error starting node: %+v", err)
 		return err
 	}
 
-	log.Println("Getting VM IP address...")
-	ip, err := host.Driver.GetIP()
-	if err != nil {
-		log.Printf("Error getting VM IP address: %v", err)
-		return err
-	}
-
-	// set (new) external IP of cluster node
-	newClusterConfig.KubernetesConfig.NodeIP = ip
-	newClusterConfig.Nodes[0].IP = ip
-	// is this same thing?
-	nodeConfig.IP = ip
-
-	if existing != nil {
-		oldKubernetesVersion, err := semver.Make(strings.TrimPrefix(existing.KubernetesConfig.KubernetesVersion, version.VersionPrefix))
-		if err != nil {
-			log.Printf("Error parsing version semver: %v", err)
-		}
-
-		newKubernetesVersion, err := semver.Make(strings.TrimPrefix(newClusterConfig.KubernetesConfig.KubernetesVersion, version.VersionPrefix))
-		if err != nil {
-			log.Printf("Error parsing version semver: %v", err)
-		}
-
-		// Check if it's an attempt to downgrade version. Avoid version downgrad.
-		if newKubernetesVersion.LT(oldKubernetesVersion) {
-			newClusterConfig.KubernetesConfig.KubernetesVersion = version.VersionPrefix + oldKubernetesVersion.String()
-			log.Println("Kubernetes version downgrade is not supported. Using version:", newClusterConfig.KubernetesConfig.KubernetesVersion)
-		}
-
-		log.Printf("Merge old k8s cluster configuration with new one")
-		newClusterConfig.KubernetesConfig.NodeIP = ip
-
-		if err := mergo.Merge(&newClusterConfig, existing); err != nil {
-			log.Printf("could not merge old and new profiles: %+v", err)
-			return err
-		}
-
-		log.Printf("Save new configuration as profile '%s' after merge", profileName)
-		if err := cfg.Write(profileName, &newClusterConfig); err != nil {
-			log.Printf("could not save profile to %s after merge: %v", profileName, err)
-			return err
-		}
-	}
-
-	//cfg.SaveProfile(newClusterConfig.Name, &newClusterConfig)
-
-	k8sBootstrapper, err := cluster.Bootstrapper(api, clusterBootstrapper, newClusterConfig, nodeConfig)
-	if err != nil {
-		log.Printf("Error getting cluster bootstrapper: %s", err)
-		return err
-	}
-
-	log.Println("Update cluster configuration...")
-	if err := k8sBootstrapper.UpdateCluster(newClusterConfig); err != nil {
-		log.Printf("Error updating cluster: %v", err)
-		return err
-	}
-
-	log.Println("Setting up certs...")
-	if err := k8sBootstrapper.SetupCerts(newClusterConfig.KubernetesConfig, nodeConfig); err != nil {
-		log.Printf("Error configuring authentication: %v", err)
-		return err
-	}
+	//log.Println("Getting VM IP address...")
+	//ip, err := host.Driver.GetIP()
+	//if err != nil {
+	//	log.Printf("Error getting VM IP address: %v", err)
+	//	return err
+	//}
+	//
+	//// set (new) external IP of cluster node
+	//newClusterConfig.KubernetesConfig.NodeIP = ip
+	//newClusterConfig.Nodes[0].IP = ip
+	//// is this same thing?
+	//nodeConfig.IP = ip
+	//
+	//if existing != nil {
+	//	oldKubernetesVersion, err := semver.Make(strings.TrimPrefix(existing.KubernetesConfig.KubernetesVersion, version.VersionPrefix))
+	//	if err != nil {
+	//		log.Printf("Error parsing version semver: %v", err)
+	//	}
+	//
+	//	newKubernetesVersion, err := semver.Make(strings.TrimPrefix(newClusterConfig.KubernetesConfig.KubernetesVersion, version.VersionPrefix))
+	//	if err != nil {
+	//		log.Printf("Error parsing version semver: %v", err)
+	//	}
+	//
+	//	// Check if it's an attempt to downgrade version. Avoid version downgrad.
+	//	if newKubernetesVersion.LT(oldKubernetesVersion) {
+	//		newClusterConfig.KubernetesConfig.KubernetesVersion = version.VersionPrefix + oldKubernetesVersion.String()
+	//		log.Println("Kubernetes version downgrade is not supported. Using version:", newClusterConfig.KubernetesConfig.KubernetesVersion)
+	//	}
+	//
+	//	log.Printf("Merge old k8s cluster configuration with new one")
+	//	newClusterConfig.KubernetesConfig.NodeIP = ip
+	//
+	//	if err := mergo.Merge(&newClusterConfig, existing); err != nil {
+	//		log.Printf("could not merge old and new profiles: %+v", err)
+	//		return err
+	//	}
+	//
+	//	log.Printf("Save new configuration as profile '%s' after merge", profileName)
+	//	if err := cfg.Write(profileName, &newClusterConfig); err != nil {
+	//		log.Printf("could not save profile to %s after merge: %v", profileName, err)
+	//		return err
+	//	}
+	//}
+	//
+	////cfg.SaveProfile(newClusterConfig.Name, &newClusterConfig)
+	//
+	//k8sBootstrapper, err := cluster.Bootstrapper(api, customConfig.Bootstrapper, newClusterConfig, nodeConfig)
+	//if err != nil {
+	//	log.Printf("Error getting cluster bootstrapper: %+v", err)
+	//	return err
+	//}
+	//
+	//log.Println("Update cluster configuration...")
+	//if err := k8sBootstrapper.UpdateCluster(newClusterConfig); err != nil {
+	//	log.Printf("Error updating cluster: %+v", err)
+	//	return err
+	//}
+	//
+	//log.Println("Setting up certs...")
+	//if err := k8sBootstrapper.SetupCerts(newClusterConfig.KubernetesConfig, nodeConfig); err != nil {
+	//	log.Printf("Error configuring authentication: %+v", err)
+	//	return err
+	//}
 
 	log.Println("Connecting to cluster...")
 	kubeHost, err := host.Driver.GetURL()
 	if err != nil {
-		log.Printf("Error connecting to cluster: %v", err)
+		log.Printf("Error connecting to cluster: %+v", err)
 	}
 	kubeHost = strings.Replace(kubeHost, "tcp://", "https://", -1)
 	kubeHost = strings.Replace(kubeHost, ":2376", ":"+strconv.Itoa(constants.APIServerPort), -1)
 
-	log.Println("Setting up kubeconfig...")
-	kcs := kubeconfig.Settings{
-		ClusterName:          profileName,
-		ClusterServerAddress: kubeHost,
-		ClientCertificate:    localpath.ClientCert(profileName),
-		CertificateAuthority: localpath.CACert(),
-		ClientKey:            localpath.ClientKey(profileName),
-		KeepContext:          newClusterConfig.KeepContext,
-		//		EmbedCerts:           false,
-	}
-	kcs.SetPath(kubeconfig.PathFromEnv())
-
-	// write the kubeconfig to the file system after everything required (like certs) are created by the bootstrapper
-	if err := kubeconfig.Update(&kcs); err != nil {
-		log.Printf("Failed to update kubeconfig file.")
-		return err
-	}
-
-	log.Println("Starting cluster components...")
-
-	if err := k8sBootstrapper.StartCluster(newClusterConfig); err != nil {
-		log.Printf("Error (re)starting cluster: %v", err)
-		return err
-	}
+	//log.Println("Starting cluster components...")
+	//
+	//if err := k8sBootstrapper.StartCluster(newClusterConfig); err != nil {
+	//	log.Printf("Error (re)starting cluster: %v", err)
+	//	return err
+	//}
+	//
+	//log.Println("Update cluster configuration... Again")
+	//if err := k8sBootstrapper.UpdateCluster(newClusterConfig); err != nil {
+	//	log.Printf("Error updating cluster again: %+v", err)
+	//	return err
+	//}
+	//
+	//log.Println("Setting up kubeconfig...")
+	//kcs := kubeconfig.Settings{
+	//	ClusterName:          profileName,
+	//	ClusterServerAddress: kubeHost,
+	//	ClientCertificate:    localpath.ClientCert(profileName),
+	//	CertificateAuthority: localpath.CACert(),
+	//	ClientKey:            localpath.ClientKey(profileName),
+	//	KeepContext:          newClusterConfig.KeepContext,
+	//	//		EmbedCerts:           false,
+	//}
+	//kcs.SetPath(kubeconfig.PathFromEnv())
+	//
+	//// write the kubeconfig to the file system after everything required (like certs) are created by the bootstrapper
+	//if err := kubeconfig.Update(&kcs); err != nil {
+	//	log.Printf("Failed to update kubeconfig file: %+v", err)
+	//	return err
+	//}
 
 	//// start 9p server mount
 	//if mount {
@@ -872,7 +882,11 @@ This can also be done automatically by setting the env var CHANGE_MINIKUBE_NONE_
 
 func getClusterConfigFromResource(d *schema.ResourceData) (cfg.ClusterConfig, CustomConfig, error) {
 	customConfig := CustomConfig{
-		PSP: false,
+		Bootstrapper:  bootstrapper.Kubeadm,
+		CacheImages:   false,
+		InstallAddons: true,
+		ProfileName:   constants.DefaultClusterName,
+		PSP:           false,
 	}
 
 	machineName := constants.DefaultClusterName
@@ -908,10 +922,12 @@ func getClusterConfigFromResource(d *schema.ResourceData) (cfg.ClusterConfig, Cu
 	memory := d.Get("memory").(int)
 	natNicType := d.Get("nat_nic_type").(string)
 	networkPlugin := d.Get("network_plugin").(string)
+	preload := d.Get("preload").(bool)
 	psp := d.Get("pod_security_policy").(bool)
 	registryMirror := d.Get("registry_mirror")
 	vmDriver := d.Get("driver").(string)
 
+	installAddons := d.Get("install_addons").(bool)
 	addons, ok := d.Get("addons").(map[string]bool)
 	if !ok {
 		addons = map[string]bool{}
@@ -932,7 +948,11 @@ func getClusterConfigFromResource(d *schema.ResourceData) (cfg.ClusterConfig, Cu
 			return cfg.ClusterConfig{}, customConfig, errors.New("for some reasons, 'enable-admission-plugins=PodSecurityPolicy' specified in extra_options cause Minikube bootstrap to hang, so you should use a 'pod_security_policy=true' instead if you want PSP")
 		}
 	}
-	// set PSP option
+
+	// set custom options
+	customConfig.CacheImages = cacheImages
+	customConfig.InstallAddons = installAddons
+	customConfig.Preload = preload
 	customConfig.PSP = psp
 
 	diskSizeMB, err := pkgutil.CalculateSizeInMB(diskSize)
@@ -951,8 +971,8 @@ func getClusterConfigFromResource(d *schema.ResourceData) (cfg.ClusterConfig, Cu
 	nodeConfig := cfg.Node{
 		Name:              machineName,
 		KubernetesVersion: kubernetesVersion,
-		//ControlPlane:      true,
-		//Worker:            true,
+		ControlPlane:      true,
+		Worker:            true,
 		//IP:                "127.0.0.1",
 	}
 
@@ -1043,7 +1063,7 @@ func resourceMinikubeDelete(d *schema.ResourceData, _ interface{}) error {
 	//	log.Println("Errors occurred deleting mount process: ", err)
 	//}
 
-	if err := cfg.DeleteProfile(profile); err != nil {
+	if err := cfg.DeleteProfile(config.Name); err != nil {
 		log.Println("Error deleting machine profile config")
 		return err
 	}

@@ -7,10 +7,13 @@ go 1.14
 require (
 	github.com/blang/semver v3.5.1+incompatible
 	github.com/docker/machine v0.16.2
+	github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b
 	github.com/hashicorp/terraform v0.12.24
 	github.com/imdario/mergo v0.3.9
 	github.com/jteeuwen/go-bindata v3.0.7+incompatible // indirect
+	github.com/pkg/errors v0.9.1
 	github.com/spf13/viper v1.3.2
+	golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e
 	k8s.io/minikube v1.9.2
 )
 
