@@ -85,6 +85,16 @@ func Start(cc config.ClusterConfig, n config.Node, cu CustomConfig, existingAddo
 		return
 	}
 
+	log.Println("Getting VM IP address...")
+	ip, err := host.Driver.GetIP()
+	if err != nil {
+		return nil, nil, fmt.Errorf("error getting VM IP address: %+v", err)
+	}
+
+	// set (new) external IP of cluster node
+	cc.KubernetesConfig.NodeIP = ip
+	cc.Nodes[0].IP = ip
+
 	var bs bootstrapper.Bootstrapper
 
 	// Must be written before bootstrap, otherwise health checks may flake due to stale IP
@@ -98,16 +108,6 @@ func Start(cc config.ClusterConfig, n config.Node, cu CustomConfig, existingAddo
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "Failed to setup kubeadm")
 	}
-
-	log.Println("Getting VM IP address...")
-	ip, err := host.Driver.GetIP()
-	if err != nil {
-		return nil, nil, fmt.Errorf("error getting VM IP address: %+v", err)
-	}
-
-	// set (new) external IP of cluster node
-	cc.KubernetesConfig.NodeIP = ip
-	cc.Nodes[0].IP = ip
 
 	err = bs.StartCluster(cc)
 	if err != nil {
@@ -128,6 +128,31 @@ func Start(cc config.ClusterConfig, n config.Node, cu CustomConfig, existingAddo
 	// enable addons, both old and new!
 	if existingAddons != nil {
 		addons.Start(cu.ProfileName, existingAddons, config.AddonList)
+	}
+
+	cmd, err := machine.CommandRunner(host)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to get command runner")
+	}
+
+	if cu.PSP {
+		// apply PSP manifest
+		manifests := []string{fmt.Sprintf("/etc/kubernetes/addons/%s", pspFileName)}
+		kubectlCmd := kubectlCommand(&cc, manifests, true)
+
+		// Retry, because sometimes we race against an apiserver restart
+		apply := func() error {
+			_, err := cmd.RunCmd(kubectlCmd)
+			if err != nil {
+				log.Printf("kubectl apply failed, will retry: %+v", err)
+			}
+			return err
+		}
+
+		err = retry.Expo(apply, 1*time.Second, time.Second*30)
+		if err != nil {
+			log.Printf("Cannot apply PodSecurityPolicy manifest in the minikube (%+v). This might cause some trouble/errors. But continue", err)
+		}
 	}
 
 	// special ops for none , like change minikube directory.
@@ -421,6 +446,9 @@ func setupKubeconfig(h *host.Host, cc *config.ClusterConfig, n *config.Node, clu
 	if cc.KubernetesConfig.APIServerName != constants.APIServerName {
 		addr = strings.Replace(addr, n.IP, cc.KubernetesConfig.APIServerName, -1)
 	}
+
+	log.Printf("set APIServer addr to %s in %s", addr, kubeconfig.PathFromEnv())
+
 	kcs = &kubeconfig.Settings{
 		ClusterName:          clusterName,
 		ClusterServerAddress: addr,

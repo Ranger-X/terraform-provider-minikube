@@ -35,6 +35,7 @@ import (
 )
 
 const clusterNotRunningStatusFlag = 1 << 1
+const pspFileName = "psp.yaml"
 
 var (
 	minimumDiskSizeInMB int = 3000
@@ -973,6 +974,7 @@ func getClusterConfigFromResource(d *schema.ResourceData) (cfg.ClusterConfig, Cu
 		KubernetesVersion: kubernetesVersion,
 		ControlPlane:      true,
 		Worker:            true,
+		Port:              constants.APIServerPort,
 		//IP:                "127.0.0.1",
 	}
 
@@ -988,6 +990,7 @@ func getClusterConfigFromResource(d *schema.ResourceData) (cfg.ClusterConfig, Cu
 		ExtraOptions:           extraOptions,
 		ShouldLoadCachedImages: cacheImages,
 		EnableDefaultCNI:       false,
+		NodePort:               constants.APIServerPort,
 		//NodeIP:                 "127.0.0.1",
 		//NodePort:               0,
 		NodeName: machineName,
@@ -1238,7 +1241,7 @@ func preparePSP() error {
 	}
 
 	addonsPath := []string{addonsFolder}
-	addonsPath = append(addonsPath, "psp.yaml")
+	addonsPath = append(addonsPath, pspFileName)
 	policiesFilePath := filepath.Join(addonsPath...)
 
 	return ioutil.WriteFile(policiesFilePath, policiesContent.Bytes(), 0644)
