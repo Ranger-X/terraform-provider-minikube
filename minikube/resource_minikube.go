@@ -172,6 +172,10 @@ subjects:
 - kind: Group
   name: system:serviceaccount:kube-system
   apiGroup: rbac.authorization.k8s.io
+# Authorize all service accounts in a kube-system namespace
+- kind: Group
+  apiGroup: rbac.authorization.k8s.io
+  name: system:serviceaccounts
 `))
 )
 
@@ -193,9 +197,9 @@ func resourceMinikube() *schema.Resource {
 		// https://github.com/kubernetes/minikube/blob/e098a3c4ca91f7907705a99e4e3466868afca482/cmd/minikube/cmd/start_flags.go
 		Schema: map[string]*schema.Schema{
 			"addons": &schema.Schema{
-				Type:        schema.TypeList,
-				Description: "Enable addons. see `minikube addons list` for a list of valid addon names.",
-				Elem:        &schema.Schema{Type: schema.TypeMap},
+				Type:        schema.TypeMap,
+				Description: "Enable addons. see `minikube addons list` for a list of valid addon names. Enabled by default: default-storageclass, storage-provisioner",
+				Elem:        schema.TypeBool,
 				ForceNew:    true,
 				Optional:    true,
 			},
@@ -629,6 +633,7 @@ func resourceMinikubeCreate(d *schema.ResourceData, meta interface{}) error {
 
 	log.Printf("clusterConfig: %+v", newClusterConfig)
 	log.Printf("nodeConfig: %+v", nodeConfig)
+	log.Printf("Addons: %+v", newClusterConfig.Addons)
 
 	validateSpecifiedDriver(existing, newClusterConfig.Driver)
 	ds := selectDriver(existing, newClusterConfig)
@@ -660,7 +665,7 @@ func resourceMinikubeCreate(d *schema.ResourceData, meta interface{}) error {
 	//}
 
 	if customConfig.PSP {
-		log.Printf("Preparing for enable PodSecurityPolicy in minikube...")
+		log.Printf("Preparing PodSecurityPolicy manifest...")
 		if err := preparePSP(); err != nil {
 			log.Printf("cannot prepare PSP YAML: %+v", err)
 			return err
@@ -677,12 +682,9 @@ func resourceMinikubeCreate(d *schema.ResourceData, meta interface{}) error {
 		*es = append(*es, e)
 	}
 
-	var existingAddons map[string]bool
-	if customConfig.InstallAddons {
-		existingAddons = map[string]bool{}
-		if existing != nil && existing.Addons != nil {
-			existingAddons = existing.Addons
-		}
+	var existingAddons = map[string]bool{}
+	if existing != nil {
+		existingAddons = existing.Addons
 	}
 
 	kcs, host, err := Start(newClusterConfig, nodeConfig, customConfig, existingAddons)
@@ -929,10 +931,16 @@ func getClusterConfigFromResource(d *schema.ResourceData) (cfg.ClusterConfig, Cu
 	vmDriver := d.Get("driver").(string)
 
 	installAddons := d.Get("install_addons").(bool)
-	addons, ok := d.Get("addons").(map[string]bool)
+	addonsM, ok := d.GetOk("addons")
 	if !ok {
-		addons = map[string]bool{}
+		addonsM = map[string]interface{}{"default-storageclass": true, "storage-provisioner": true}
 	}
+	// typecast map to bool values
+	addons := map[string]bool{}
+	for k, v := range addonsM.(map[string]interface{}) {
+		addons[k] = v.(bool)
+	}
+	//log.Printf("addons: %+v", addons)
 
 	extraOptionsStr := d.Get("extra_options").(string)
 

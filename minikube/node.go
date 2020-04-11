@@ -6,6 +6,7 @@ import (
 	"github.com/blang/semver"
 	"github.com/docker/machine/libmachine"
 	"github.com/docker/machine/libmachine/host"
+	"github.com/imdario/mergo"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/minikube/pkg/addons"
@@ -125,24 +126,20 @@ func Start(cc config.ClusterConfig, n config.Node, cu CustomConfig, existingAddo
 		log.Printf("Unable to load cached images from config file.")
 	}
 
-	// enable addons, both old and new!
-	if existingAddons != nil {
-		addons.Start(cu.ProfileName, existingAddons, config.AddonList)
-	}
-
-	cmd, err := machine.CommandRunner(host)
+	c, err := machine.CommandRunner(host)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "failed to get command runner")
+		return nil, nil, fmt.Errorf("failed to get command runner: %+v", err)
 	}
 
 	if cu.PSP {
+		log.Printf("Applying default Pod Security Policies...")
 		// apply PSP manifest
 		manifests := []string{fmt.Sprintf("/etc/kubernetes/addons/%s", pspFileName)}
 		kubectlCmd := kubectlCommand(&cc, manifests, true)
 
 		// Retry, because sometimes we race against an apiserver restart
 		apply := func() error {
-			_, err := cmd.RunCmd(kubectlCmd)
+			_, err := c.RunCmd(kubectlCmd)
 			if err != nil {
 				log.Printf("kubectl apply failed, will retry: %+v", err)
 			}
@@ -152,6 +149,27 @@ func Start(cc config.ClusterConfig, n config.Node, cu CustomConfig, existingAddo
 		err = retry.Expo(apply, 1*time.Second, time.Second*30)
 		if err != nil {
 			log.Printf("Cannot apply PodSecurityPolicy manifest in the minikube (%+v). This might cause some trouble/errors. But continue", err)
+		}
+	}
+
+	// enable addons AFTER PodSecurityPolicy was applied
+	var mAddons map[string]bool
+	if cu.InstallAddons {
+		log.Printf("mAddons: %+v existingAddons: %+v", cc.Addons, existingAddons)
+		mAddons = cc.Addons
+		if existingAddons != nil {
+			if err := mergo.Merge(&mAddons, existingAddons); err != nil {
+				return nil, nil, fmt.Errorf("cannot merge old and new addons configuration: %+v", err)
+			}
+		}
+
+		for addonName, enabled := range mAddons {
+			log.Printf("Setting addons.%s=%s in profile %q", addonName, strconv.FormatBool(enabled), cu.ProfileName)
+			err := addons.Set(addonName, strconv.FormatBool(enabled), cu.ProfileName)
+			if err != nil {
+				// Intentionally non-fatal
+				log.Printf("Enabling addon '%s' returned an error: %+v", addonName, err)
+			}
 		}
 	}
 
