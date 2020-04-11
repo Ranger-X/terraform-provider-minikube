@@ -170,7 +170,7 @@ subjects:
   name: system:nodes
   apiGroup: rbac.authorization.k8s.io
 - kind: Group
-  name: system:serviceaccounts:kube-system
+  name: system:serviceaccount:kube-system
   apiGroup: rbac.authorization.k8s.io
 `))
 )
